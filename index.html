@@ -6,12 +6,13 @@
 <meta name="theme-color" content="#0c0e13">
 <title>Scanner</title>
 <link rel="icon" href="data:,">
-<script>window.__pre=fetch("https://fapi.binance.com/fapi/v1/ticker/price",{cache:"no-store"}).then(function(r){return r.ok?r.json():null}).catch(function(){return null});</script>
+<script>
+// OPTIONAL: your Cloudflare Worker URL (see cloudflare-worker.js), e.g. 'https://scanner.yourname.workers.dev'
+// With it, prices and candles are downloaded in a compact format (far less data).
+window.SCANNER_PROXY='';
+window.__pre=fetch(window.SCANNER_PROXY?window.SCANNER_PROXY+'/lite/prices':'https://fapi.binance.com/fapi/v1/ticker/price',{cache:'no-store'}).then(function(r){return r.ok?r.json():null}).catch(function(){return null});
+</script>
 <link rel="preconnect" href="https://fapi.binance.com" crossorigin>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap"></noscript>
 <link rel="stylesheet" href="styles.css">
 <script src="app.js" defer></script>
 </head>

@@ -4,7 +4,7 @@
  * Successful connection modes are remembered to improve subsequent requests.
  * ========================================================================== */
 const DIRECT_API = 'https://fapi.binance.com';
-const CUSTOM_PROXY_BASE = ''; // optional: your own cloudflare-worker.js URL
+const CUSTOM_PROXY_BASE = (window.SCANNER_PROXY || '').replace(/\/$/, ''); // set in index.html: your own cloudflare-worker.js URL
 const CORS_PROXIES = [
   full => `https://corsproxy.io/?url=${encodeURIComponent(full)}`,
   full => `https://api.allorigins.win/raw?url=${encodeURIComponent(full)}`
@@ -17,6 +17,9 @@ function buildUrl(mode, path) {
   if (typeof m === 'function') return m(DIRECT_API + path);
   return m + path;
 }
+// A path can be a string, or {std, lite}: 'lite' = compact Worker endpoint, 'std' = normal Binance path.
+const isLite = mode => !!CUSTOM_PROXY_BASE && mode === 0;
+const pathFor = (mode, p) => typeof p === 'string' ? p : (isLite(mode) ? p.lite : p.std);
 const readJSON = (k, d) => { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch (e) { return d; } };
 let activeMode = Number(localStorage.getItem('signalApiMode') || 0);
 if (!(Number.isInteger(activeMode) && activeMode >= 0 && activeMode < TOTAL_MODES)) activeMode = 0;
@@ -28,7 +31,7 @@ async function fetchOnce(mode, path) {
   if (w > 0) await sleep(w);
   const ctrl = new AbortController(), to = setTimeout(() => ctrl.abort(), 20000);
   try {
-    const r = await fetch(buildUrl(mode, path), { cache: 'no-store', signal: ctrl.signal });
+    const r = await fetch(buildUrl(mode, pathFor(mode, path)), { cache: 'no-store', signal: ctrl.signal });
     if (!r.ok) {
       if (r.status === 429 || r.status === 418) pauseUntil = Date.now() + (r.status === 418 ? 60e3 : 10e3);
       const err = new Error(`${r.status} ${r.statusText}`); err.status = r.status; throw err;
@@ -68,9 +71,9 @@ const TRIM  = { '15m': 110, '1h': 110, '4h': 110, '1d': 45, '1w': 35, '1M': 35 }
 const TFS = ['15m', '1h', '4h', '1d', '1w', '1M'];
 const TF_LABELS = { '15m': '15M', '1h': '1H', '4h': '4H', '1d': '1D', '1w': '1W', '1M': '1M' };
 const SMMA_LEN = 7, RSI_LEN = 14, DMI_LEN = 14;
-const PRICE_INTERVAL = 5e3;   // live price refresh (tiny request)
+const PRICE_INTERVAL = 10e3;  // live price refresh; the biggest data consumer, so keep it as high as is acceptable
 const CACHE_SAVE_EVERY = 60e3;
-const CACHE_KEY = 'signalScannerCacheV2';
+const CACHE_KEY = 'signalScannerCacheV3'; // new key: drops incompatible caches left by older versions
 
 const cache = readJSON(CACHE_KEY, {});
 const state = {
@@ -189,6 +192,7 @@ function recomputeLive(c) {
 // Full recompute: only when candles (or the selected timeframe) change.
 function recompute(c) {
   const data = c[state.timeframe] || { c: [], h: [], l: [] };
+  data.h = data.h || []; data.l = data.l || []; data.c = data.c || [];
   c.smmaV = smmaValue(data.c);
   c.rsiS = rsiState(data.c);
   c.dmi = dmiTrend(dmiRaw(data.h || [], data.l || [], data.c || []));
@@ -197,9 +201,10 @@ function recompute(c) {
   recomputeLive(c);
 }
 
+const validCandles = x => !!x && Array.isArray(x.c) && Array.isArray(x.h) && Array.isArray(x.l) && x.c.length === x.h.length && x.c.length === x.l.length && Number.isFinite(x.n);
 function newCoin(symbol, price) {
   const c = { symbol, price, volume: NaN };
-  for (const tf of TFS) { const cached = cache.k?.[tf]?.[symbol]; if (cached) c[tf] = cached; }
+  for (const tf of TFS) { const cached = cache.k?.[tf]?.[symbol]; if (validCandles(cached)) { delete cached.o; c[tf] = cached; } }
   recompute(c);
   return c;
 }
@@ -219,24 +224,27 @@ function needsUpdate(c, tf, now) {
 async function loadCandles(c, tf, now) {
   let st = c[tf];
   if (st && (st.lv === undefined || (now - st.n) / IV_MS[tf] > LIMIT[tf])) st = null; // old cache format / far too stale -> full reload
-  const cur = st || { n: 0, o: [], h: [], l: [], c: [], lv: null };
+  const cur = st || { n: 0, h: [], l: [], c: [], lv: null };
   const limit = st ? Math.min(LIMIT[tf], Math.ceil((now - st.n) / IV_MS[tf]) + 2) : LIMIT[tf];
-  const ks = await getJSON(`/fapi/v1/klines?symbol=${encodeURIComponent(c.symbol)}&interval=${tf}&limit=${limit}${st ? `&startTime=${st.n}` : ''}`);
+  const qs = `symbol=${encodeURIComponent(c.symbol)}&interval=${tf}&limit=${limit}${st ? `&startTime=${st.n}` : ''}`;
+  const ks = await getJSON({ std: `/fapi/v1/klines?${qs}`, lite: `/lite/klines?${qs}` });
   if (!Array.isArray(ks)) return;
   for (const k of ks) {
-    const closeTime = Number(k[6]);
+    // Binance format has 12 fields; the Worker's compact format has 5: [closeTime, high, low, close, quoteVol]
+    const lite = k.length === 5;
+    const closeTime = Number(lite ? k[0] : k[6]);
     if (closeTime > now) continue; // still-forming candle: excluded
     if (closeTime < cur.n) continue; // already have this one
-    cur.o.push(Number(k[1])); cur.h.push(Number(k[2])); cur.l.push(Number(k[3])); cur.c.push(Number(k[4]));
-    cur.lv = Number(k[7]); // quote volume of this closed candle
+    cur.h.push(Number(lite ? k[1] : k[2])); cur.l.push(Number(lite ? k[2] : k[3])); cur.c.push(Number(lite ? k[3] : k[4]));
+    cur.lv = Number(lite ? k[4] : k[7]); // quote volume of this closed candle
     cur.n = closeTime + 1;
   }
   const trim = TRIM[tf];
-  if (cur.c.length > trim) { cur.o = cur.o.slice(-trim); cur.h = cur.h.slice(-trim); cur.l = cur.l.slice(-trim); cur.c = cur.c.slice(-trim); }
+  if (cur.c.length > trim) { cur.h = cur.h.slice(-trim); cur.l = cur.l.slice(-trim); cur.c = cur.c.slice(-trim); }
   cur.t = cur.c.length ? now : now + 57e3; // empty symbol: retry only after ~1 min
   c[tf] = cur;
 }
-let syncRequested = false;
+let syncRequested = false, syncBackoff = 0;
 async function syncCandles() {
   if (state.syncing) { syncRequested = true; return; }
   state.syncing = true;
@@ -246,17 +254,19 @@ async function syncCandles() {
     const vv = c => Number.isFinite(c.volume) ? c.volume : -1;
     const todo = [...state.coins.values()].filter(c => needsUpdate(c, tf, now)).sort((a, b) => vv(b) - vv(a));
     const total = todo.length; let p = 0, n = 0;
+    let fails = 0; // stop hammering a dead connection: abort after 8 failures in a row
     async function worker() {
-      while (p < total) {
+      while (p < total && fails < 8) {
         const c = todo[p++];
-        try { await loadCandles(c, tf, now); if (tf === state.timeframe) recompute(c); }
-        catch (e) { (c._f ||= {})[tf] = Date.now(); console.warn('klines', c.symbol, e.message || e); }
+        try { await loadCandles(c, tf, now); fails = 0; if (tf === state.timeframe) recompute(c); }
+        catch (e) { fails++; (c._f ||= {})[tf] = Date.now(); console.warn('klines', c.symbol, e.message || e); }
         if (total > 20 && ++n % 10 === 0) { setStatus(`Loading data… ${n}/${total}`); scheduleRender(); }
       }
     }
     if (total) {
       if (total > 20) setStatus(`Loading data… 0/${total}`);
       await Promise.all(Array.from({ length: Math.min(concurrency(), total) }, worker));
+      if (fails >= 8) syncBackoff = Date.now() + 30e3;
       saveCache();
     }
     scheduleRender(); setOk();
@@ -273,9 +283,15 @@ function saveCache() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     const k = Object.fromEntries(TFS.map(tf => [tf, {}])), m = {};
-    for (const c of state.coins.values()) {
-      for (const tf of TFS) if (c[tf]) k[tf][c.symbol] = c[tf];
-      m[c.symbol] = c.price;
+    for (const c of state.coins.values()) m[c.symbol] = c.price;
+    // Selected timeframe first; others only while under the budget (avoids a silent localStorage quota failure)
+    let used = 0;
+    for (const tf of [state.timeframe, ...TFS.filter(t => t !== state.timeframe)]) {
+      const part = {};
+      for (const c of state.coins.values()) if (c[tf]) part[c.symbol] = c[tf];
+      const len = JSON.stringify(part).length;
+      if (used + len > 3.5e6) continue;
+      k[tf] = part; used += len;
     }
     lastSave = Date.now();
     try { localStorage.setItem(CACHE_KEY, JSON.stringify({ v: 2, k, m })); } catch (e) {}
@@ -286,11 +302,10 @@ function saveCache() {
 const validSymbol = s => /^[A-Z0-9]{1,20}USDT$/.test(s); // ASCII-only USDT perpetuals (drops dated futures and Chinese-named coins)
 function applyTicker(ts) {
   const seen = new Set();
-  for (const t of ts) {
-    const sym = t.symbol;
-    if (!validSymbol(sym)) continue;
-    const price = Number(t.price);
-    if (!Number.isFinite(price)) continue;
+  // Binance: [{symbol:'BTCUSDT',price:'..'}]  |  Worker compact: {BTC: 67000.1}
+  const list = Array.isArray(ts) ? ts.map(t => [t.symbol, Number(t.price)]) : Object.entries(ts).map(([b, p]) => [b + 'USDT', Number(p)]);
+  for (const [sym, price] of list) {
+    if (!validSymbol(sym) || !Number.isFinite(price)) continue;
     seen.add(sym);
     const c = state.coins.get(sym);
     if (!c) state.coins.set(sym, newCoin(sym, price));
@@ -304,7 +319,7 @@ async function refreshMarket() {
   try {
     let ts = null;
     if (window.__pre) { try { ts = await window.__pre; } catch (e) {} window.__pre = null; }
-    if (!Array.isArray(ts)) ts = await getJSON('/fapi/v1/ticker/price');
+    if (!ts || typeof ts !== 'object') ts = await getJSON({ std: '/fapi/v1/ticker/price', lite: '/lite/prices' });
     applyTicker(ts);
     state.lastPrice = Date.now();
     scheduleRender();
@@ -313,7 +328,7 @@ async function refreshMarket() {
       const now = Date.now(), tf = state.timeframe;
       let need = false;
       for (const c of state.coins.values()) if (needsUpdate(c, tf, now)) { need = true; break; }
-      if (need) syncCandles(); else setOk();
+      if (need && Date.now() >= syncBackoff) syncCandles(); else setOk();
     }
   } catch (e) {
     console.error(e);
@@ -524,7 +539,7 @@ async function priceLoop() {
 }
 
 function init() {
-  if (cache.v === 2 && cache.m) {
+  if (cache.v === 2 && cache.m && typeof cache.m === 'object') {
     for (const s in cache.m) if (validSymbol(s)) state.coins.set(s, newCoin(s, cache.m[s]));
     if (state.coins.size) { render(); setStatus('Showing saved data • updating…'); }
   } else setStatus('Loading Binance USDT perpetuals…');
